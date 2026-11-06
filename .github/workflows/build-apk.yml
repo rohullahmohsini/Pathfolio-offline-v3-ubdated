@@ -1,18 +1,46 @@
-name: Build Pathfolio APK
+name: Build Signed Pathfolio APK and AAB
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - main
 
 jobs:
-  build:
+  build-release:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Download project
+      - name: Download repository
         uses: actions/checkout@v4
+
+      - name: Find and extract Android project
+        shell: bash
+        run: |
+          ZIP_FILE=$(find . -maxdepth 1 -type f -iname "*.zip" | head -n 1)
+
+          if [ -z "$ZIP_FILE" ]; then
+            echo "No ZIP project file was found."
+            exit 1
+          fi
+
+          echo "Using project ZIP: $ZIP_FILE"
+
+          rm -rf extracted-project
+          mkdir extracted-project
+          unzip -q "$ZIP_FILE" -d extracted-project
+
+          SETTINGS_FILE=$(find extracted-project \
+            -type f \
+            \( -name "settings.gradle" -o -name "settings.gradle.kts" \) \
+            | head -n 1)
+
+          if [ -z "$SETTINGS_FILE" ]; then
+            echo "settings.gradle or settings.gradle.kts was not found."
+            exit 1
+          fi
+
+          PROJECT_DIR=$(dirname "$SETTINGS_FILE")
+
+          echo "Android project directory: $PROJECT_DIR"
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
 
       - name: Install Java 17
         uses: actions/setup-java@v4
@@ -25,23 +53,202 @@ jobs:
         with:
           gradle-version: "8.9"
 
-      - name: Find and extract project ZIP
+      - name: Validate signing secrets
+        shell: bash
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          SIGNING_STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
+          SIGNING_KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
+          SIGNING_KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
         run: |
-          ZIP_FILE=$(find . -maxdepth 1 -type f -iname "Pathfolio_Offline_CV_Portfolio_v3*.zip" | head -n 1)
-          if [ -z "$ZIP_FILE" ]; then
-            echo "Project ZIP file was not found."
+          test -n "$KEYSTORE_BASE64" || {
+            echo "KEYSTORE_BASE64 is missing."
+            exit 1
+          }
+
+          test -n "$SIGNING_STORE_PASSWORD" || {
+            echo "SIGNING_STORE_PASSWORD is missing."
+            exit 1
+          }
+
+          test -n "$SIGNING_KEY_ALIAS" || {
+            echo "SIGNING_KEY_ALIAS is missing."
+            exit 1
+          }
+
+          test -n "$SIGNING_KEY_PASSWORD" || {
+            echo "SIGNING_KEY_PASSWORD is missing."
+            exit 1
+          }
+
+          echo "All signing secrets are available."
+
+      - name: Restore private Keystore
+        shell: bash
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+        run: |
+          printf '%s' "$KEYSTORE_BASE64" \
+            | tr -d '\r\n\t ' \
+            | base64 --decode \
+            > "$RUNNER_TEMP/pathfolio-release.jks"
+
+          if [ ! -s "$RUNNER_TEMP/pathfolio-release.jks" ]; then
+            echo "The restored Keystore is empty."
             exit 1
           fi
-          mkdir -p extracted-project
-          unzip -o "$ZIP_FILE" -d extracted-project
 
-      - name: Build Android APK
-        run: gradle -p extracted-project assembleDebug --console=plain
+          echo "Keystore restored successfully."
 
-      - name: Upload generated APK
+      - name: Verify Keystore and alias
+        shell: bash
+        env:
+          SIGNING_STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
+          SIGNING_KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
+        run: |
+          keytool -list \
+            -keystore "$RUNNER_TEMP/pathfolio-release.jks" \
+            -storepass "$SIGNING_STORE_PASSWORD" \
+            -alias "$SIGNING_KEY_ALIAS" > /dev/null
+
+          echo "Keystore and alias verified successfully."
+
+      - name: Build unsigned Release APK and AAB
+        shell: bash
+        run: |
+          gradle -p "$PROJECT_DIR" \
+            :app:assembleRelease \
+            :app:bundleRelease \
+            --stacktrace \
+            --console=plain
+
+      - name: Locate Android build tools
+        shell: bash
+        run: |
+          SDK_ROOT="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
+
+          BUILD_TOOLS=$(find "$SDK_ROOT/build-tools" \
+            -mindepth 1 \
+            -maxdepth 1 \
+            -type d \
+            | sort -V \
+            | tail -n 1)
+
+          if [ -z "$BUILD_TOOLS" ]; then
+            echo "Android Build Tools were not found."
+            exit 1
+          fi
+
+          echo "Using Android Build Tools: $BUILD_TOOLS"
+          echo "BUILD_TOOLS=$BUILD_TOOLS" >> "$GITHUB_ENV"
+
+      - name: Find generated APK and AAB
+        shell: bash
+        run: |
+          UNSIGNED_APK=$(find "$PROJECT_DIR/app/build/outputs/apk/release" \
+            -type f \
+            -name "*.apk" \
+            | head -n 1)
+
+          UNSIGNED_AAB=$(find "$PROJECT_DIR/app/build/outputs/bundle/release" \
+            -type f \
+            -name "*.aab" \
+            | head -n 1)
+
+          if [ -z "$UNSIGNED_APK" ]; then
+            echo "Release APK was not generated."
+            exit 1
+          fi
+
+          if [ -z "$UNSIGNED_AAB" ]; then
+            echo "Release AAB was not generated."
+            exit 1
+          fi
+
+          echo "APK found: $UNSIGNED_APK"
+          echo "AAB found: $UNSIGNED_AAB"
+
+          echo "UNSIGNED_APK=$UNSIGNED_APK" >> "$GITHUB_ENV"
+          echo "UNSIGNED_AAB=$UNSIGNED_AAB" >> "$GITHUB_ENV"
+
+      - name: Prepare release output folder
+        shell: bash
+        run: |
+          rm -rf release-output
+          mkdir release-output
+
+      - name: Align and sign Release APK
+        shell: bash
+        env:
+          SIGNING_STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
+          SIGNING_KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
+          SIGNING_KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
+        run: |
+          "$BUILD_TOOLS/zipalign" \
+            -f \
+            -p \
+            4 \
+            "$UNSIGNED_APK" \
+            release-output/Pathfolio-3.1.0-aligned.apk
+
+          "$BUILD_TOOLS/apksigner" sign \
+            --ks "$RUNNER_TEMP/pathfolio-release.jks" \
+            --ks-key-alias "$SIGNING_KEY_ALIAS" \
+            --ks-pass env:SIGNING_STORE_PASSWORD \
+            --key-pass env:SIGNING_KEY_PASSWORD \
+            --out release-output/Pathfolio-3.1.0-release.apk \
+            release-output/Pathfolio-3.1.0-aligned.apk
+
+          rm -f release-output/Pathfolio-3.1.0-aligned.apk
+
+      - name: Sign Release AAB
+        shell: bash
+        env:
+          SIGNING_STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
+          SIGNING_KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
+          SIGNING_KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
+        run: |
+          cp "$UNSIGNED_AAB" \
+            release-output/Pathfolio-3.1.0-release.aab
+
+          jarsigner \
+            -keystore "$RUNNER_TEMP/pathfolio-release.jks" \
+            -storepass:env SIGNING_STORE_PASSWORD \
+            -keypass:env SIGNING_KEY_PASSWORD \
+            -sigalg SHA256withRSA \
+            -digestalg SHA-256 \
+            release-output/Pathfolio-3.1.0-release.aab \
+            "$SIGNING_KEY_ALIAS"
+
+      - name: Verify signed APK
+        shell: bash
+        run: |
+          "$BUILD_TOOLS/apksigner" verify \
+            --verbose \
+            --print-certs \
+            release-output/Pathfolio-3.1.0-release.apk
+
+      - name: Verify signed AAB
+        shell: bash
+        run: |
+          jarsigner -verify \
+            -verbose \
+            -certs \
+            release-output/Pathfolio-3.1.0-release.aab
+
+      - name: Upload signed APK and AAB
         uses: actions/upload-artifact@v4
         with:
-          name: Pathfolio-Offline-APK
-          path: extracted-project/app/build/outputs/apk/debug/app-debug.apk
+          name: Pathfolio-3.1.0-SIGNED
+          path: |
+            release-output/Pathfolio-3.1.0-release.apk
+            release-output/Pathfolio-3.1.0-release.aab
           if-no-files-found: error
           retention-days: 30
+
+      - name: Delete temporary signing files
+        if: always()
+        shell: bash
+        run: |
+          rm -f "$RUNNER_TEMP/pathfolio-release.jks"
+          rm -f release-output/*-aligned.apk
